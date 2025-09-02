@@ -1,6 +1,6 @@
-# OCserv Docker 部署工具
+# OCserv Docker（全局翻墙）部署工具
 
-一个功能完整的 OCserv (OpenConnect Server) Docker 部署脚本，支持快速部署、SSL证书自动申请、与nginx共存等高级功能。
+一个功能完整的全局翻墙工具OCserv (OpenConnect Server) Docker 部署脚本，支持快速部署、SSL证书自动申请、与nginx共存等高级功能。
 
 ## 🚀 功能特性
 
