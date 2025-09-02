@@ -32,7 +32,15 @@ cd ocserv-docker
 chmod +x ocserv_deploy.sh ssl_certificate.sh
 ```
 
-### 2. 快速部署
+### 2. 交互式菜单部署(推荐)
+
+直接运行脚本进入交互式菜单:
+
+```bash
+./ocserv_deploy.sh
+```
+
+### 3. 快速部署
 
 使用预设配置快速部署 (用户名: NoRoute, 密码: 654321):
 
@@ -40,19 +48,13 @@ chmod +x ocserv_deploy.sh ssl_certificate.sh
 ./ocserv_deploy.sh -q
 ```
 
-### 3. 自定义部署
+### 4. 自定义部署
 
 ```bash
 ./ocserv_deploy.sh -c
 ```
 
-### 4. 交互式菜单
 
-直接运行脚本进入交互式菜单:
-
-```bash
-./ocserv_deploy.sh
-```
 
 ## 📁 目录结构
 
