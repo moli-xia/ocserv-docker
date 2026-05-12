@@ -197,6 +197,102 @@ get_container_host_port() {
     fi
 }
 
+is_valid_ipv4() {
+    local ip="$1"
+
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+
+    local IFS='.'
+    local octet
+    for octet in $ip; do
+        if (( octet < 0 || octet > 255 )); then
+            return 1
+        fi
+    done
+
+    return 0
+}
+
+detect_public_ipv4() {
+    local ip=""
+    local endpoint
+
+    for endpoint in \
+        "https://api.ipify.org" \
+        "https://ifconfig.me" \
+        "https://ip.sb"; do
+        ip=$(curl -4 -fsSL --max-time 8 "$endpoint" 2>/dev/null | tr -d '\r\n[:space:]')
+        if is_valid_ipv4 "$ip"; then
+            echo "$ip"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+generate_ocserv_config() {
+    local config_dir="$1"
+    local container_port="${2:-$DEFAULT_OCSERV_CONTAINER_PORT}"
+    local public_ip=""
+
+    mkdir -p "$config_dir"
+
+    if public_ip=$(detect_public_ipv4); then
+        print_message "检测到服务器公网 IP: $public_ip"
+    else
+        print_warning "未能自动检测服务器公网 IP，将跳过 no-route 配置。若连接 VPN 后无法访问服务器公网 IP，请手动补充。"
+        public_ip=""
+    fi
+
+    cat > "$config_dir/ocserv.conf" << EOF
+auth = "plain[passwd=/etc/ocserv/ocpasswd]"
+tcp-port = $container_port
+udp-port = $container_port
+run-as-user = nobody
+run-as-group = daemon
+socket-file = /var/run/ocserv-socket
+server-cert = /etc/ocserv/server-cert.pem
+server-key = /etc/ocserv/server-key.pem
+ca-cert = /etc/ocserv/ca-cert.pem
+isolate-workers = true
+max-clients = 16
+max-same-clients = 2
+server-stats-reset-time = 604800
+keepalive = 32400
+dpd = 90
+mobile-dpd = 1800
+switch-to-tcp-timeout = 25
+try-mtu-discovery = true
+cert-user-oid = 0.9.2342.19200300.100.1.1
+tls-priorities = "NORMAL:%SERVER_PRECEDENCE:%COMPAT:-VERS-SSL3.0"
+auth-timeout = 240
+min-reauth-time = 300
+max-ban-score = 50
+ban-reset-time = 300
+cookie-timeout = 300
+deny-roaming = false
+rekey-time = 172800
+rekey-method = ssl
+use-occtl = true
+pid-file = /var/run/ocserv.pid
+device = vpns
+predictable-ips = true
+default-domain = example.com
+ipv4-network = 10.66.0.0
+ipv4-netmask = 255.255.255.0
+dns = 8.8.8.8
+dns = 8.8.4.4
+route = default
+cisco-client-compat = true
+dtls-legacy = true
+EOF
+
+    if [[ -n "$public_ip" ]]; then
+        echo "no-route = ${public_ip}/255.255.255.255" >> "$config_dir/ocserv.conf"
+    fi
+}
+
 deploy_with_port_coexistence() {
     local domain="$1"
     local container_name="$2"
@@ -218,10 +314,10 @@ deploy_with_port_coexistence() {
     fi
     
     # 生成配置文件
-    generate_ocserv_config "$domain" "$config_dir" "$username"
+    generate_ocserv_config "$config_dir" "$DEFAULT_OCSERV_CONTAINER_PORT"
     
     # 创建密码文件
-    generate_password_hash "$username" "$password" "$config_dir"
+    echo "$username:*:$(generate_password_hash "$password")" > "$config_dir/ocpasswd"
     
     # 申请SSL证书
     if check_certbot || install_certbot; then
@@ -603,48 +699,7 @@ quick_deploy() {
     print_message "配置目录已创建: $OCSERV_CONFIG_DIR"
     
     # 创建ocserv配置文件
-    cat > "$OCSERV_CONFIG_DIR/ocserv.conf" << EOF
-auth = "plain[passwd=/etc/ocserv/ocpasswd]"
-tcp-port = $CONTAINER_PORT
-udp-port = $CONTAINER_PORT
-run-as-user = nobody
-run-as-group = daemon
-socket-file = /var/run/ocserv-socket
-server-cert = /etc/ocserv/server-cert.pem
-server-key = /etc/ocserv/server-key.pem
-ca-cert = /etc/ocserv/ca-cert.pem
-isolate-workers = true
-max-clients = 16
-max-same-clients = 2
-server-stats-reset-time = 604800
-keepalive = 32400
-dpd = 90
-mobile-dpd = 1800
-switch-to-tcp-timeout = 25
-try-mtu-discovery = true
-cert-user-oid = 0.9.2342.19200300.100.1.1
-tls-priorities = "NORMAL:%SERVER_PRECEDENCE:%COMPAT:-VERS-SSL3.0"
-auth-timeout = 240
-min-reauth-time = 300
-max-ban-score = 50
-ban-reset-time = 300
-cookie-timeout = 300
-deny-roaming = false
-rekey-time = 172800
-rekey-method = ssl
-use-occtl = true
-pid-file = /var/run/ocserv.pid
-device = vpns
-predictable-ips = true
-default-domain = example.com
-ipv4-network = 10.66.0.0
-ipv4-netmask = 255.255.255.0
-dns = 8.8.8.8
-dns = 8.8.4.4
-route = default
-cisco-client-compat = true
-dtls-legacy = true
-EOF
+    generate_ocserv_config "$OCSERV_CONFIG_DIR" "$CONTAINER_PORT"
     
     # 生成密码哈希并创建用户密码文件
     print_message "生成用户密码文件..."
@@ -765,48 +820,7 @@ custom_deploy() {
     print_message "配置目录已创建: $CONFIG_DIR"
     
     # 创建ocserv配置文件
-    cat > $CONFIG_DIR/ocserv.conf << EOF
-auth = "plain[passwd=/etc/ocserv/ocpasswd]"
-tcp-port = $CONTAINER_PORT
-udp-port = $CONTAINER_PORT
-run-as-user = nobody
-run-as-group = daemon
-socket-file = /var/run/ocserv-socket
-server-cert = /etc/ocserv/server-cert.pem
-server-key = /etc/ocserv/server-key.pem
-ca-cert = /etc/ocserv/ca-cert.pem
-isolate-workers = true
-max-clients = 16
-max-same-clients = 2
-server-stats-reset-time = 604800
-keepalive = 32400
-dpd = 90
-mobile-dpd = 1800
-switch-to-tcp-timeout = 25
-try-mtu-discovery = true
-cert-user-oid = 0.9.2342.19200300.100.1.1
-tls-priorities = "NORMAL:%SERVER_PRECEDENCE:%COMPAT:-VERS-SSL3.0"
-auth-timeout = 240
-min-reauth-time = 300
-max-ban-score = 50
-ban-reset-time = 300
-cookie-timeout = 300
-deny-roaming = false
-rekey-time = 172800
-rekey-method = ssl
-use-occtl = true
-pid-file = /var/run/ocserv.pid
-device = vpns
-predictable-ips = true
-default-domain = example.com
-ipv4-network = 10.66.0.0
-ipv4-netmask = 255.255.255.0
-dns = 8.8.8.8
-dns = 8.8.4.4
-route = default
-cisco-client-compat = true
-dtls-legacy = true
-EOF
+    generate_ocserv_config "$CONFIG_DIR" "$CONTAINER_PORT"
     
     # 生成密码哈希并创建用户密码文件
     print_message "生成用户密码文件..."
