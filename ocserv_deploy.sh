@@ -18,10 +18,16 @@ OCSERV_CONFIG_DIR="/opt/ocserv"
 DEFAULT_CONTAINER_NAME="ocserv"
 DEFAULT_USERNAME="NoRoute"
 DEFAULT_PASSWORD="654321"
+DEFAULT_OCSERV_CONTAINER_PORT="443"
+REPO_URL="https://github.com/moli-xia/ocserv-docker"
 
 # 防火墙和端口管理函数
 manage_firewall() {
     print_message "配置防火墙和端口..."
+
+    open_port_with_bt_panel 80 tcp http-80 || true
+    open_port_with_bt_panel 443 tcp https-443 || true
+    open_port_with_bt_panel 443 udp https-443-udp || true
     
     # 检测防火墙类型并开启端口
     if command -v ufw >/dev/null 2>&1; then
@@ -78,100 +84,114 @@ find_available_port() {
     echo "$port"
 }
 
-create_nginx_proxy_config() {
-    local domain="$1"
-    local ocserv_port="$2"
-    local config_file="/www/server/nginx/conf/vhost/ocserv-proxy.conf"
-    
-    cat > "$config_file" << EOF
-# ocserv反向代理配置
-server {
-    listen 443 ssl http2;
-    server_name $domain;
-    
-    # SSL证书配置
-    ssl_certificate /etc/letsencrypt/live/$domain/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-SHA256:ECDHE-RSA-AES256-SHA384;
-    ssl_prefer_server_ciphers off;
-    ssl_session_cache shared:SSL:10m;
-    ssl_session_timeout 10m;
-    
-    # ocserv反向代理
-    location / {
-        proxy_pass http://127.0.0.1:$ocserv_port;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        
-        # WebSocket支持
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        
-        # 超时设置
-        proxy_connect_timeout 60s;
-        proxy_send_timeout 60s;
-        proxy_read_timeout 60s;
-    }
-}
+resolve_vpn_host_port() {
+    local preferred_port="${1:-443}"
+    local fallback_start="$preferred_port"
 
-# HTTP重定向到HTTPS
-server {
-    listen 80;
-    server_name $domain;
-    return 301 https://\$server_name\$request_uri;
-}
-EOF
+    if [[ "$preferred_port" == "443" ]]; then
+        fallback_start="8443"
+    fi
 
-    print_message "已创建nginx反向代理配置: $config_file"
+    if check_port_availability "$preferred_port"; then
+        echo "$preferred_port"
+        return 0
+    fi
+
+    local available_port
+    available_port=$(find_available_port "$fallback_start") || return 1
+
+    print_warning "检测到宿主机端口 $preferred_port 已被占用，已自动切换到端口 $available_port。宿主机 nginx 可继续监听 443。" >&2
+    echo "$available_port"
 }
 
 setup_port_coexistence() {
     local domain="$1"
     local container_name="$2"
-    
-    print_message "设置端口共存模式..."
-    
-    # 检查443端口是否被占用
-    if check_port_availability 443; then
-        print_message "443端口可用，将直接使用443端口"
+
+    print_message "设置端口共存模式..." >&2
+
+    local ocserv_port
+    ocserv_port=$(resolve_vpn_host_port 443)
+    if [ $? -ne 0 ]; then
+        print_error "无法找到可用端口" >&2
+        return 1
+    fi
+
+    if [ "$ocserv_port" = "443" ]; then
+        print_message "443端口可用，ocserv 将直接使用 443" >&2
+    else
+        print_message "宿主机 443 由 nginx 使用，ocserv 将改为使用 $ocserv_port" >&2
+    fi
+
+    echo "$ocserv_port"
+}
+
+open_vpn_port_in_firewall() {
+    local port="$1"
+
+    if [[ -z "$port" ]]; then
+        return 1
+    fi
+
+    open_port_with_bt_panel "$port" "tcp" "ocserv-tcp-${port}" || true
+    open_port_with_bt_panel "$port" "udp" "ocserv-udp-${port}" || true
+
+    if command -v ufw >/dev/null 2>&1; then
+        ufw allow "${port}/tcp" >/dev/null 2>&1 || true
+        ufw allow "${port}/udp" >/dev/null 2>&1 || true
+    elif command -v firewall-cmd >/dev/null 2>&1; then
+        firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 || true
+        firewall-cmd --permanent --add-port="${port}/udp" >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    elif command -v iptables >/dev/null 2>&1; then
+        iptables -C INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 || true
+        iptables -C INPUT -p udp --dport "$port" -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p udp --dport "$port" -j ACCEPT >/dev/null 2>&1 || true
+        if command -v iptables-save >/dev/null 2>&1; then
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        fi
+    else
+        print_warning "未检测到已知防火墙，请手动放行端口 ${port}/tcp 和 ${port}/udp"
         return 0
     fi
-    
-    print_warning "检测到443端口被占用，将使用端口共存模式"
-    
-    # 寻找可用端口
-    local ocserv_port
-    ocserv_port=$(find_available_port 8443)
-    if [ $? -ne 0 ]; then
-        print_error "无法找到可用端口"
+
+    print_message "已放行 ocserv 使用端口: $port/tcp, $port/udp"
+}
+
+is_bt_panel_installed() {
+    command -v bt >/dev/null 2>&1 && [[ -d "/www/server/panel" ]]
+}
+
+open_port_with_bt_panel() {
+    local port="$1"
+    local protocol="$2"
+    local remark="${3:-ocserv}"
+
+    if ! is_bt_panel_installed; then
         return 1
     fi
-    
-    print_message "将为ocserv分配端口: $ocserv_port"
-    
-    # 创建nginx反向代理配置
-    create_nginx_proxy_config "$domain" "$ocserv_port"
-    
-    # 重新加载nginx配置
-    if nginx -t >/dev/null 2>&1; then
-        nginx -s reload
-        print_message "nginx配置已重新加载"
-    else
-        print_error "nginx配置测试失败"
-        return 1
+
+    bt 2 "$port" "$protocol" "$remark" >/dev/null 2>&1 || return 1
+    bt 1 >/dev/null 2>&1 || true
+    return 0
+}
+
+get_container_host_port() {
+    local container_name="$1"
+    local container_port="${2:-$DEFAULT_OCSERV_CONTAINER_PORT}"
+    local port_mapping
+
+    port_mapping=$(docker port "$container_name" "${container_port}/tcp" 2>/dev/null | head -1)
+    if [[ -n "$port_mapping" ]]; then
+        echo "${port_mapping##*:}"
     fi
-    
-    # 返回ocserv端口
-    echo "$ocserv_port"
 }
 
 deploy_with_port_coexistence() {
     local domain="$1"
     local container_name="$2"
+    # 兼容旧调用参数，当前仅用于输出提示
+    : "${domain:=}"
+    : "${container_name:=}"
     local config_dir="$3"
     local username="$4"
     local password="$5"
@@ -193,33 +213,25 @@ deploy_with_port_coexistence() {
     generate_password_hash "$username" "$password" "$config_dir"
     
     # 申请SSL证书
-    if check_certbot; then
+    if check_certbot || install_certbot; then
         print_message "开始申请Let's Encrypt SSL证书..."
-        bash ./ssl_certificate.sh
+        request_ssl_certificate_for_config "$config_dir" "$domain"
     else
         generate_self_signed_cert "$domain" "$config_dir"
     fi
     
-    # 启动容器（使用分配的端口）
-    if [ "$ocserv_port" = "443" ]; then
-        # 直接使用443端口
-        docker run -d --name "$container_name" --privileged \
-            -p 443:443 -p 443:443/udp \
-            -v "$config_dir:/etc/ocserv" \
-            tommylau/ocserv:latest
-    else
-        # 使用分配的端口
-        docker run -d --name "$container_name" --privileged \
-            -p "$ocserv_port:443" -p "$ocserv_port:443/udp" \
-            -v "$config_dir:/etc/ocserv" \
-            tommylau/ocserv:latest
-    fi
+    # 启动容器（容器内始终监听443，宿主机按可用端口映射）
+    docker run -d --name "$container_name" --privileged \
+        -p "$ocserv_port:${DEFAULT_OCSERV_CONTAINER_PORT}" \
+        -p "$ocserv_port:${DEFAULT_OCSERV_CONTAINER_PORT}/udp" \
+        -v "$config_dir:/etc/ocserv" \
+        tommylau/ocserv:latest
     
     if [ $? -eq 0 ]; then
         print_message "ocserv部署成功！"
         if [ "$ocserv_port" != "443" ]; then
-            print_message "访问地址: $domain (通过nginx反向代理)"
-            print_message "内部端口: $ocserv_port"
+            print_message "访问地址: $domain:$ocserv_port"
+            print_message "宿主机 nginx 继续使用 443，ocserv 使用独立端口 $ocserv_port"
         else
             print_message "访问地址: $domain:443"
         fi
@@ -334,8 +346,10 @@ cleanup_nginx_proxy() {
         rm -f "$config_file"
         if nginx -t >/dev/null 2>&1; then
             nginx -s reload
-            print_message "已清理nginx代理配置"
+            print_message "已清理旧版nginx代理配置"
         fi
+    else
+        print_message "未发现旧版nginx代理配置"
     fi
 }
 
@@ -448,17 +462,16 @@ print_error() {
 }
 
 print_header() {
-    echo -e "${BLUE}================================${NC}"
-    echo -e "${BLUE}    ocserv Docker 部署脚本${NC}"
-    echo -e "${BLUE}================================${NC}"
+    echo -e "${BLUE}+----------------------------------------------------------+${NC}"
+    echo -e "${BLUE}|               ocserv Docker 一键部署脚本                 |${NC}"
+    echo -e "${BLUE}|          Repo: https://github.com/moli-xia/ocserv-docker |${NC}"
+    echo -e "${BLUE}+----------------------------------------------------------+${NC}"
 }
 
 print_menu() {
     clear
-    echo -e "${CYAN}========================================${NC}"
-    echo -e "${CYAN}        ocserv Docker 部署脚本${NC}"
-    echo -e "${CYAN}    支持与nginx/OpenResty端口共存${NC}"
-    echo -e "${CYAN}========================================${NC}"
+    print_header
+    echo -e "${CYAN}    支持与 nginx/OpenResty/宝塔面板 并行运行${NC}"
     echo ""
     echo -e "${BLUE}部署选项：${NC}"
     echo -e "${YELLOW}1.${NC} 快速自动部署 (预设账号: $DEFAULT_USERNAME/$DEFAULT_PASSWORD)"
@@ -466,7 +479,7 @@ print_menu() {
     echo -e "${YELLOW}3.${NC} 管理SSL证书"
     echo -e "${YELLOW}4.${NC} 服务状态管理"
     echo -e "${YELLOW}5.${NC} 端口状态检查"
-    echo -e "${YELLOW}6.${NC} 清理nginx代理配置"
+    echo -e "${YELLOW}6.${NC} 清理旧版nginx代理配置"
     echo -e "${YELLOW}7.${NC} 停止并删除ocserv服务"
     echo -e "${YELLOW}0.${NC} 退出"
     echo ""
@@ -531,17 +544,23 @@ print(hashed)
 # 快速自动部署
 quick_deploy() {
     print_message "开始快速自动部署..."
-    
+
     # 预设配置
     USERNAME="NoRoute"
     PASSWORD="654321"
-    PORT="443"
+    PORT=$(resolve_vpn_host_port 443)
+    if [ $? -ne 0 ] || [[ -z "$PORT" ]]; then
+        print_error "无法分配可用端口"
+        return 1
+    fi
     CONTAINER_NAME="ocserv"
+    CONTAINER_PORT="$DEFAULT_OCSERV_CONTAINER_PORT"
     
     print_message "使用预设配置："
     echo "  用户名: $USERNAME"
     echo "  密码: $PASSWORD"
-    echo "  端口: $PORT"
+    echo "  宿主机端口: $PORT"
+    echo "  容器端口: $CONTAINER_PORT"
     echo "  容器名: $CONTAINER_NAME"
     
     # 停止并删除已存在的容器
@@ -562,8 +581,8 @@ quick_deploy() {
     # 创建ocserv配置文件
     cat > "$OCSERV_CONFIG_DIR/ocserv.conf" << EOF
 auth = "plain[passwd=/etc/ocserv/ocpasswd]"
-tcp-port = $PORT
-udp-port = $PORT
+tcp-port = $CONTAINER_PORT
+udp-port = $CONTAINER_PORT
 run-as-user = nobody
 run-as-group = daemon
 socket-file = /var/run/ocserv-socket
@@ -612,14 +631,16 @@ EOF
     # 拉取镜像
     print_message "拉取 ocserv 镜像..."
     docker pull tommylau/ocserv:latest
-    
+
+    open_vpn_port_in_firewall "$PORT"
+
     # 启动容器
     print_message "启动 ocserv 容器..."
     docker run -d \
         --name $CONTAINER_NAME \
         --restart unless-stopped \
-        -p $PORT:$PORT \
-        -p $PORT:$PORT/udp \
+        -p $PORT:$CONTAINER_PORT \
+        -p $PORT:$CONTAINER_PORT/udp \
         -v "$OCSERV_CONFIG_DIR:/etc/ocserv" \
         --cap-add=NET_ADMIN \
         --cap-add=NET_BROADCAST \
@@ -669,7 +690,7 @@ custom_deploy() {
     read -p "请输入用户名: " USERNAME
     read -s -p "请输入密码: " PASSWORD
     echo ""
-    read -p "请输入端口 (默认443): " PORT
+    read -p "请输入宿主机端口 (默认443，若443被nginx占用将自动改用8443+): " PORT
     PORT=${PORT:-443}
     read -p "请输入容器名 (默认ocserv): " CONTAINER_NAME
     CONTAINER_NAME=${CONTAINER_NAME:-ocserv}
@@ -684,11 +705,20 @@ custom_deploy() {
         print_error "端口号必须是1-65535之间的数字"
         exit 1
     fi
+
+    PORT=$(resolve_vpn_host_port "$PORT")
+    if [ $? -ne 0 ] || [[ -z "$PORT" ]]; then
+        print_error "无法分配可用端口"
+        return 1
+    fi
+
+    CONTAINER_PORT="$DEFAULT_OCSERV_CONTAINER_PORT"
     
     print_message "使用自定义配置："
     echo "  用户名: $USERNAME"
     echo "  密码: $PASSWORD"
-    echo "  端口: $PORT"
+    echo "  宿主机端口: $PORT"
+    echo "  容器端口: $CONTAINER_PORT"
     echo "  容器名: $CONTAINER_NAME"
     
     # 停止并删除已存在的容器
@@ -714,8 +744,8 @@ custom_deploy() {
     # 创建ocserv配置文件
     cat > $CONFIG_DIR/ocserv.conf << EOF
 auth = "plain[passwd=/etc/ocserv/ocpasswd]"
-tcp-port = $PORT
-udp-port = $PORT
+tcp-port = $CONTAINER_PORT
+udp-port = $CONTAINER_PORT
 run-as-user = nobody
 run-as-group = daemon
 socket-file = /var/run/ocserv-socket
@@ -764,14 +794,16 @@ EOF
     # 拉取镜像
     print_message "拉取 ocserv 镜像..."
     docker pull tommylau/ocserv:latest
-    
+
+    open_vpn_port_in_firewall "$PORT"
+
     # 启动容器
     print_message "启动 ocserv 容器..."
     docker run -d \
         --name $CONTAINER_NAME \
         --restart unless-stopped \
-        -p $PORT:$PORT \
-        -p $PORT:$PORT/udp \
+        -p $PORT:$CONTAINER_PORT \
+        -p $PORT:$CONTAINER_PORT/udp \
         -v "$CONFIG_DIR:/etc/ocserv" \
         --cap-add=NET_ADMIN \
         --cap-add=NET_BROADCAST \
@@ -887,82 +919,337 @@ fix_password() {
     fi
 }
 
-# 检查certbot是否安装
-check_certbot() {
-    if command -v certbot >/dev/null 2>&1; then
-        print_message "Certbot 检查通过"
+# 检测系统类型
+detect_system() {
+    if [[ -f /etc/os-release ]]; then
+        . /etc/os-release
+        echo "$NAME"
+    elif command -v lsb_release >/dev/null 2>&1; then
+        lsb_release -si
+    elif [[ -f /etc/redhat-release ]]; then
+        cat /etc/redhat-release
+    else
+        uname -s
+    fi
+}
+
+# 检查并安装 Certbot
+install_certbot() {
+    local system
+    system=$(detect_system)
+    print_message "检测到系统: $system"
+
+    if check_certbot; then
+        print_message "Certbot 已安装"
         return 0
     fi
 
-    print_warning "Certbot 未安装，尝试通过 snap 安装..."
+    print_message "正在安装 Certbot..."
 
-    if command -v snap >/dev/null 2>&1; then
-        print_message "检测到 snap，开始安装 certbot..."
-        snap install core >/dev/null 2>&1 || true
-        snap refresh core >/dev/null 2>&1 || true
-        snap install --classic certbot >/dev/null 2>&1 || true
-        ln -sf /snap/bin/certbot /usr/bin/certbot || true
+    case "$system" in
+        *Ubuntu*|*Debian*)
+            apt-get update >/dev/null 2>&1 || true
+            apt-get install -y certbot >/dev/null 2>&1
+            ;;
+        *CentOS*|*Red\ Hat*|*Rocky*|*AlmaLinux*)
+            if command -v dnf >/dev/null 2>&1; then
+                dnf install -y epel-release >/dev/null 2>&1 || true
+                dnf install -y certbot >/dev/null 2>&1
+            else
+                yum install -y epel-release >/dev/null 2>&1 || true
+                yum install -y certbot >/dev/null 2>&1
+            fi
+            ;;
+        *)
+            if command -v snap >/dev/null 2>&1; then
+                snap install certbot --classic >/dev/null 2>&1
+            elif command -v pip3 >/dev/null 2>&1; then
+                pip3 install certbot >/dev/null 2>&1
+            else
+                print_error "无法自动安装 Certbot，请手动安装后重试"
+                return 1
+            fi
+            ;;
+    esac
+
+    check_certbot
+}
+
+# 检查 Certbot 是否可用
+check_certbot() {
+    if command -v certbot >/dev/null 2>&1; then
+        certbot --version >/dev/null 2>&1
+        return $?
+    elif [[ -f "/snap/bin/certbot" ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
+manage_firewall_for_ssl() {
+    print_message "为 SSL 证书申请配置防火墙和端口..."
+
+    open_port_with_bt_panel 80 tcp cert-http-80 || true
+    open_port_with_bt_panel 443 tcp cert-https-443 || true
+
+    if command -v ufw >/dev/null 2>&1; then
+        ufw allow 80/tcp >/dev/null 2>&1 || true
+        ufw allow 443/tcp >/dev/null 2>&1 || true
+    elif command -v firewall-cmd >/dev/null 2>&1; then
+        firewall-cmd --permanent --add-port=80/tcp >/dev/null 2>&1 || true
+        firewall-cmd --permanent --add-port=443/tcp >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    elif command -v iptables >/dev/null 2>&1; then
+        iptables -C INPUT -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1 || true
+        iptables -C INPUT -p tcp --dport 443 -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p tcp --dport 443 -j ACCEPT >/dev/null 2>&1 || true
+        if command -v iptables-save >/dev/null 2>&1; then
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        fi
     else
-        if command -v apt-get >/dev/null 2>&1; then
-            print_message "安装 snapd (Ubuntu/Debian)..."
-            apt-get update -y >/dev/null 2>&1 || true
-            apt-get install -y snapd >/dev/null 2>&1 || true
-            systemctl enable --now snapd >/dev/null 2>&1 || true
-            ln -sf /var/lib/snapd/snap /snap || true
-            print_message "通过 snap 安装 certbot..."
-            snap install core >/dev/null 2>&1 || true
-            snap refresh core >/dev/null 2>&1 || true
-            snap install --classic certbot >/dev/null 2>&1 || true
-            ln -sf /snap/bin/certbot /usr/bin/certbot || true
-        elif command -v dnf >/dev/null 2>&1; then
-            print_message "安装 snapd (Fedora)..."
-            dnf install -y snapd >/dev/null 2>&1 || true
-            systemctl enable --now snapd >/dev/null 2>&1 || true
-            ln -sf /var/lib/snapd/snap /snap || true
-            print_message "通过 snap 安装 certbot..."
-            snap install core >/dev/null 2>&1 || true
-            snap refresh core >/dev/null 2>&1 || true
-            snap install --classic certbot >/dev/null 2>&1 || true
-            ln -sf /snap/bin/certbot /usr/bin/certbot || true
-        elif command -v yum >/dev/null 2>&1; then
-            print_message "安装 snapd (CentOS/RHEL)..."
-            yum install -y epel-release >/dev/null 2>&1 || true
-            yum install -y snapd >/dev/null 2>&1 || true
-            systemctl enable --now snapd >/dev/null 2>&1 || true
-            ln -sf /var/lib/snapd/snap /snap || true
-            print_message "通过 snap 安装 certbot..."
-            snap install core >/dev/null 2>&1 || true
-            snap refresh core >/dev/null 2>&1 || true
-            snap install --classic certbot >/dev/null 2>&1 || true
-            ln -sf /snap/bin/certbot /usr/bin/certbot || true
-        else
-            print_error "无法自动安装 Certbot，请手动安装后重试"
+        print_warning "未检测到已知防火墙，请手动确保 80 和 443 已开启"
+    fi
+}
+
+get_domain_input() {
+    local domain=""
+
+    echo ""
+    print_message "请输入您的域名（例如: example.com）"
+    print_message "注意：域名必须已解析到当前服务器"
+
+    while true; do
+        read -p "域名: " domain
+        domain=$(echo "$domain" | grep -o '[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z0-9][a-zA-Z0-9.-]*' | tail -1)
+
+        if [[ -z "$domain" ]]; then
+            print_error "域名不能为空，请重新输入"
+            continue
+        fi
+
+        if [[ "$domain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]] && [[ "$domain" == *.* ]]; then
+            echo "$domain"
+            return 0
+        fi
+
+        print_error "域名格式不正确，请重新输入"
+    done
+}
+
+check_port_usage() {
+    local port="$1"
+
+    if command -v netstat >/dev/null 2>&1; then
+        netstat -tlnp 2>/dev/null | grep -q ":$port "
+        return $?
+    elif command -v ss >/dev/null 2>&1; then
+        ss -tlnp 2>/dev/null | grep -q ":$port "
+        return $?
+    fi
+
+    return 1
+}
+
+get_port_process() {
+    local port="$1"
+
+    if command -v netstat >/dev/null 2>&1; then
+        netstat -tlnp 2>/dev/null | grep ":$port " | awk '{print $7}' | head -1
+    elif command -v ss >/dev/null 2>&1; then
+        ss -tlnp 2>/dev/null | grep ":$port " | awk '{print $6}' | head -1
+    fi
+}
+
+stop_port_service() {
+    local port="$1"
+    local process_info="$2"
+
+    if [[ -z "$process_info" ]]; then
+        return 0
+    fi
+
+    if echo "$process_info" | grep -q "nginx"; then
+        print_warning "检测到 nginx 占用 ${port} 端口，尝试停止 nginx..."
+
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl stop nginx >/dev/null 2>&1 || true
+            sleep 3
+            if ! systemctl is-active nginx >/dev/null 2>&1; then
+                return 0
+            fi
+        fi
+
+        if command -v nginx >/dev/null 2>&1; then
+            nginx -s stop >/dev/null 2>&1 || true
+            sleep 3
+        fi
+
+        if ! check_port_usage "$port"; then
+            return 0
+        fi
+    fi
+
+    local pid
+    pid=$(echo "$process_info" | sed 's/.*\([0-9][0-9]*\).*/\1/' | tail -1)
+    if [[ -n "$pid" ]] && [[ "$pid" =~ ^[0-9]+$ ]]; then
+        kill "$pid" >/dev/null 2>&1 || true
+        sleep 2
+        kill -9 "$pid" >/dev/null 2>&1 || true
+    fi
+
+    return 0
+}
+
+restart_nginx_service() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl enable nginx >/dev/null 2>&1 || true
+        systemctl start nginx >/dev/null 2>&1 || true
+        if systemctl is-active nginx >/dev/null 2>&1; then
+            print_message "nginx 服务已恢复"
+            return 0
+        fi
+    fi
+
+    if command -v nginx >/dev/null 2>&1; then
+        nginx >/dev/null 2>&1 || true
+    fi
+}
+
+apply_ssl_certificate() {
+    local domain="$1"
+    local config_dir="$2"
+    local nginx_was_stopped=false
+    local clean_domain
+    clean_domain=$(echo "$domain" | grep -o '[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z0-9][a-zA-Z0-9.-]*' | tail -1)
+
+    manage_firewall_for_ssl
+
+    if ! check_certbot; then
+        if ! install_certbot; then
+            print_error "Certbot 安装失败，无法申请 SSL 证书"
             return 1
         fi
     fi
 
-    if command -v certbot >/dev/null 2>&1; then
-        print_message "Certbot 安装成功！"
-        return 0
-    else
-        print_error "Certbot 安装失败"
+    mkdir -p "$config_dir"
+
+    if check_port_usage 80; then
+        local process_info
+        process_info=$(get_port_process 80)
+        if echo "$process_info" | grep -q "nginx"; then
+            nginx_was_stopped=true
+        fi
+        stop_port_service 80 "$process_info"
+    fi
+
+    local certbot_cmd="certbot"
+    if [[ -f "/snap/bin/certbot" ]]; then
+        certbot_cmd="/snap/bin/certbot"
+    fi
+
+    local certbot_output
+    certbot_output=$($certbot_cmd certonly --standalone --non-interactive --agree-tos --email "admin@$clean_domain" --domains "$clean_domain" --preferred-challenges http 2>&1)
+    local certbot_exit_code=$?
+
+    if [[ "$certbot_exit_code" -ne 0 ]]; then
+        print_error "SSL 证书申请失败"
+        echo "$certbot_output" | head -10
+        if [[ "$nginx_was_stopped" == "true" ]]; then
+            restart_nginx_service
+        fi
         return 1
+    fi
+
+    cp "/etc/letsencrypt/live/$clean_domain/fullchain.pem" "$config_dir/server-cert.pem"
+    cp "/etc/letsencrypt/live/$clean_domain/privkey.pem" "$config_dir/server-key.pem"
+    cp "/etc/letsencrypt/live/$clean_domain/chain.pem" "$config_dir/ca-cert.pem"
+    chmod 600 "$config_dir/server-key.pem"
+    chmod 644 "$config_dir/server-cert.pem" "$config_dir/ca-cert.pem"
+
+    if [[ "$nginx_was_stopped" == "true" ]]; then
+        restart_nginx_service
+    fi
+
+    echo "$clean_domain" > "$config_dir/domain.txt"
+    print_message "SSL 证书申请成功"
+    return 0
+}
+
+setup_auto_renewal() {
+    local domain="$1"
+    local config_dir="$2"
+    local clean_domain
+    clean_domain=$(echo "$domain" | grep -o '[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z0-9][a-zA-Z0-9.-]*' | tail -1)
+
+    cat > /etc/cron.daily/ocserv-renew << EOF
+#!/bin/bash
+CERTBOT_CMD="/snap/bin/certbot"
+if [[ ! -f "\$CERTBOT_CMD" ]]; then
+    CERTBOT_CMD="certbot"
+fi
+
+\$CERTBOT_CMD renew --quiet
+
+if [ \$? -eq 0 ]; then
+    cp /etc/letsencrypt/live/$clean_domain/fullchain.pem $config_dir/server-cert.pem
+    cp /etc/letsencrypt/live/$clean_domain/privkey.pem $config_dir/server-key.pem
+    cp /etc/letsencrypt/live/$clean_domain/chain.pem $config_dir/ca-cert.pem
+    chmod 600 $config_dir/server-key.pem
+    chmod 644 $config_dir/server-cert.pem $config_dir/ca-cert.pem
+    docker restart \$(docker ps --format "{{.Names}}" | grep ocserv | head -1) >/dev/null 2>&1
+fi
+EOF
+
+    chmod +x /etc/cron.daily/ocserv-renew
+    print_message "已设置 SSL 证书自动续签"
+}
+
+get_running_ocserv_container_name() {
+    docker ps --format "{{.Names}}" | grep ocserv | head -1
+}
+
+resolve_config_dir_for_container() {
+    local container_name="$1"
+
+    if [[ -z "$container_name" || "$container_name" == "ocserv" ]]; then
+        echo "$OCSERV_CONFIG_DIR"
+    else
+        echo "${OCSERV_CONFIG_DIR}-${container_name}"
     fi
 }
 
+request_ssl_certificate_for_config() {
+    local config_dir="$1"
+    local domain="${2:-}"
 
+    if [[ -z "$domain" ]]; then
+        domain=$(get_domain_input)
+    fi
 
-# 管理SSL证书
-manage_ssl_cert() {
-    print_message "SSL证书管理..."
-    
-    # 运行独立的SSL证书申请脚本
-    if [[ -f "./ssl_certificate.sh" ]]; then
-        bash ./ssl_certificate.sh
-    else
-        print_error "SSL证书申请脚本未找到"
+    if [[ -z "$domain" ]]; then
+        print_error "域名获取失败"
         return 1
     fi
+
+    if apply_ssl_certificate "$domain" "$config_dir"; then
+        setup_auto_renewal "$domain" "$config_dir"
+        return 0
+    fi
+
+    return 1
+}
+
+# 管理 SSL 证书
+manage_ssl_cert() {
+    print_message "SSL 证书管理..."
+
+    local container_name
+    local config_dir
+    container_name=$(get_running_ocserv_container_name)
+    config_dir=$(resolve_config_dir_for_container "$container_name")
+
+    mkdir -p "$config_dir"
+    request_ssl_certificate_for_config "$config_dir"
 }
 
 # 查看服务状态
@@ -974,20 +1261,25 @@ show_service_status() {
         echo ""
         echo "✅ 服务运行中："
         docker ps --filter "name=ocserv" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
-        
-        # 检查端口监听
-        echo ""
-        echo "端口监听状态："
-        netstat -tlnp | grep :443 || echo "端口 443 未监听"
-        
+
         # 显示连接信息
         echo ""
         echo "连接信息："
         CONTAINER_NAME=$(docker ps --format "table {{.Names}}" | grep ocserv | head -1)
         if [[ -n "$CONTAINER_NAME" ]]; then
+            local host_port
+            host_port=$(get_container_host_port "$CONTAINER_NAME" "$DEFAULT_OCSERV_CONTAINER_PORT")
+            echo "端口监听状态："
+            if [[ -n "$host_port" ]]; then
+                netstat -tlnp 2>/dev/null | grep ":$host_port " || echo "宿主机端口 $host_port 未监听"
+            else
+                echo "未检测到宿主机端口映射"
+            fi
+            echo ""
             echo "容器名: $CONTAINER_NAME"
             echo "配置文件: $OCSERV_CONFIG_DIR"
-            echo "端口: 443"
+            echo "宿主机端口: ${host_port:-未检测到}"
+            echo "容器端口: $DEFAULT_OCSERV_CONTAINER_PORT"
             echo "协议: AnyConnect"
         fi
     else
@@ -1021,8 +1313,8 @@ ask_for_ssl_certificate() {
         case $ssl_choice in
             1)
                 print_message "开始申请Let's Encrypt SSL证书..."
-                bash ./ssl_certificate.sh
-                return 0
+                request_ssl_certificate_for_config "$config_dir"
+                return $?
                 ;;
             2)
                 print_message "跳过SSL证书配置，使用默认配置"
@@ -1082,7 +1374,6 @@ show_help() {
 # 交互式主菜单
 interactive_menu() {
     while true; do
-        print_header
         print_menu
         
         read -p "请输入选择 (0-7): " choice
