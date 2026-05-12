@@ -175,6 +175,17 @@ open_port_with_bt_panel() {
     return 0
 }
 
+get_bt_panel_port() {
+    local port_file="/www/server/panel/data/port.pl"
+
+    if [[ -f "$port_file" ]]; then
+        tr -dc '0-9' < "$port_file"
+        return 0
+    fi
+
+    echo "8888"
+}
+
 get_container_host_port() {
     local container_name="$1"
     local container_port="${2:-$DEFAULT_OCSERV_CONTAINER_PORT}"
@@ -276,8 +287,12 @@ check_port_status() {
 
 # 确保宝塔面板服务正常运行
 ensure_bt_panel_running() {
+    if ! is_bt_panel_installed; then
+        return 0
+    fi
+
     print_message "检查宝塔面板服务状态..."
-    
+
     # 检查宝塔面板是否运行
     if ! bt status | grep -q "already running"; then
         print_warning "宝塔面板服务未运行，正在启动..."
@@ -296,13 +311,15 @@ ensure_bt_panel_running() {
     fi
     
     # 检查宝塔面板端口
-    if ! netstat -tlnp 2>/dev/null | grep -q ":15857"; then
-        print_warning "宝塔面板端口未监听，尝试重启..."
+    local panel_port
+    panel_port=$(get_bt_panel_port)
+    if [[ -n "$panel_port" ]] && ! netstat -tlnp 2>/dev/null | grep -q ":$panel_port "; then
+        print_warning "宝塔面板端口 $panel_port 未监听，尝试重启..."
         bt restart >/dev/null 2>&1
         sleep 5
-        
-        if netstat -tlnp 2>/dev/null | grep -q ":15857"; then
-            print_message "宝塔面板端口已恢复监听"
+
+        if netstat -tlnp 2>/dev/null | grep -q ":$panel_port "; then
+            print_message "宝塔面板端口已恢复监听: $panel_port"
         else
             print_error "宝塔面板端口恢复失败"
             return 1
@@ -315,27 +332,34 @@ ensure_bt_panel_running() {
 # 在证书申请后确保服务恢复
 post_certificate_cleanup() {
     print_message "证书申请完成，确保服务正常运行..."
-    
+
     # 确保宝塔面板运行
-    ensure_bt_panel_running
-    
+    ensure_bt_panel_running || true
+
     # 确保nginx运行
-    if ! systemctl is-active nginx >/dev/null 2>&1; then
-        print_warning "nginx服务未运行，正在启动..."
-        systemctl start nginx >/dev/null 2>&1
-        sleep 3
-        
-        if systemctl is-active nginx >/dev/null 2>&1; then
-            print_message "nginx服务已恢复"
+    if command -v systemctl >/dev/null 2>&1; then
+        if ! systemctl is-active nginx >/dev/null 2>&1; then
+            print_warning "nginx服务未运行，正在启动..."
+            systemctl start nginx >/dev/null 2>&1 || true
+            sleep 3
         else
-            print_error "nginx服务启动失败"
+            nginx -s reload >/dev/null 2>&1 || true
         fi
+    elif command -v nginx >/dev/null 2>&1; then
+        nginx >/dev/null 2>&1 || nginx -s reload >/dev/null 2>&1 || true
     fi
-    
+
     # 显示服务状态
     print_message "当前服务状态："
-    echo "  宝塔面板: $(bt status | grep -o 'already running\|not running' | head -1)"
-    echo "  nginx: $(systemctl is-active nginx 2>/dev/null || echo 'not running')"
+    if is_bt_panel_installed; then
+        echo "  宝塔面板: $(bt status | grep -o 'already running\|not running' | head -1)"
+        echo "  宝塔端口: $(get_bt_panel_port)"
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        echo "  nginx: $(systemctl is-active nginx 2>/dev/null || echo 'not running')"
+    else
+        echo "  nginx: $(ps -ef | grep '[n]ginx' >/dev/null && echo 'running' || echo 'not running')"
+    fi
     echo "  ocserv: $(docker ps | grep ocserv >/dev/null && echo 'running' || echo 'not running')"
 }
 
@@ -1104,6 +1128,7 @@ restart_nginx_service() {
     if command -v systemctl >/dev/null 2>&1; then
         systemctl enable nginx >/dev/null 2>&1 || true
         systemctl start nginx >/dev/null 2>&1 || true
+        sleep 3
         if systemctl is-active nginx >/dev/null 2>&1; then
             print_message "nginx 服务已恢复"
             return 0
@@ -1127,6 +1152,7 @@ apply_ssl_certificate() {
     if ! check_certbot; then
         if ! install_certbot; then
             print_error "Certbot 安装失败，无法申请 SSL 证书"
+            post_certificate_cleanup
             return 1
         fi
     fi
@@ -1157,6 +1183,7 @@ apply_ssl_certificate() {
         if [[ "$nginx_was_stopped" == "true" ]]; then
             restart_nginx_service
         fi
+        post_certificate_cleanup
         return 1
     fi
 
@@ -1172,6 +1199,7 @@ apply_ssl_certificate() {
 
     echo "$clean_domain" > "$config_dir/domain.txt"
     print_message "SSL 证书申请成功"
+    post_certificate_cleanup
     return 0
 }
 
