@@ -637,12 +637,11 @@ pid-file = /var/run/ocserv.pid
 device = vpns
 predictable-ips = true
 default-domain = example.com
-ipv4-network = 192.168.1.0
+ipv4-network = 10.66.0.0
 ipv4-netmask = 255.255.255.0
 dns = 8.8.8.8
 dns = 8.8.4.4
 route = default
-no-route = 192.168.1.0/255.255.255.0
 cisco-client-compat = true
 dtls-legacy = true
 EOF
@@ -800,12 +799,11 @@ pid-file = /var/run/ocserv.pid
 device = vpns
 predictable-ips = true
 default-domain = example.com
-ipv4-network = 192.168.1.0
+ipv4-network = 10.66.0.0
 ipv4-netmask = 255.255.255.0
 dns = 8.8.8.8
 dns = 8.8.4.4
 route = default
-no-route = 192.168.1.0/255.255.255.0
 cisco-client-compat = true
 dtls-legacy = true
 EOF
