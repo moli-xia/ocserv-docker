@@ -28,9 +28,27 @@
 
 ### 1. 下载脚本
 
+方式一: 使用 `git clone`
+
 ```bash
 git clone https://github.com/moli-xia/ocserv-docker.git
 cd ocserv-docker
+chmod +x ocserv_deploy.sh
+```
+
+方式二: 使用 `wget`
+
+```bash
+mkdir -p ocserv-docker && cd ocserv-docker
+wget -O ocserv_deploy.sh https://raw.githubusercontent.com/moli-xia/ocserv-docker/main/ocserv_deploy.sh
+chmod +x ocserv_deploy.sh
+```
+
+方式三: 使用 `curl`
+
+```bash
+mkdir -p ocserv-docker && cd ocserv-docker
+curl -L https://raw.githubusercontent.com/moli-xia/ocserv-docker/main/ocserv_deploy.sh -o ocserv_deploy.sh
 chmod +x ocserv_deploy.sh
 ```
 
