@@ -2,13 +2,13 @@
 
 来源仓库: <https://github.com/moli-xia/ocserv-docker>
 
-一个单脚本版的 OCserv (OpenConnect Server) Docker 部署工具，支持快速部署、自定义部署、Let's Encrypt 证书申请续签，以及与宿主机 `nginx` / OpenResty / 宝塔面板环境共存。
+一个轻量引导脚本加主部署脚本的 OCserv (OpenConnect Server) Docker 部署工具，支持一键配置、快速部署、自定义部署、Let's Encrypt 证书申请续签，以及与宿主机 `nginx` / OpenResty / 宝塔面板环境共存。
 
 - Windows、Android、macOS 客户端请见 [Releases](Releases) 页面。
 
 ## 功能特性
 
-- 一键部署: 支持快速部署和自定义部署
+- 一键配置: `install.sh` 自动拉起主部署脚本，优先推荐
 - 单脚本整合: `ocserv_deploy.sh` 同时负责部署、证书申请和续签
 - 端口共存: 宿主机 `443` 被占用时，自动切换到 `8443+`
 - 宝塔兼容: 检测到宝塔面板后，自动尝试放行实际使用的端口
@@ -26,39 +26,68 @@
 
 ## 安装使用
 
-### 1. 下载脚本
+### 1. 优先推荐: 一键配置脚本
+
+方式一: 使用 `curl`
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/moli-xia/ocserv-docker/main/install.sh)
+```
+
+方式二: 使用 `wget`
+
+```bash
+wget -qO- https://raw.githubusercontent.com/moli-xia/ocserv-docker/main/install.sh | bash
+```
+
+说明:
+
+- 引导脚本会自动下载或复用最新的 `ocserv_deploy.sh`
+- 不带参数时默认进入交互式菜单
+- 也可以直接透传参数，例如快速部署:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/moli-xia/ocserv-docker/main/install.sh) -- -q
+```
+
+### 2. 备用方式: 手动下载脚本
 
 方式一: 使用 `git clone`
 
 ```bash
 git clone https://github.com/moli-xia/ocserv-docker.git
 cd ocserv-docker
-chmod +x ocserv_deploy.sh
+chmod +x install.sh ocserv_deploy.sh
+./install.sh
 ```
 
 方式二: 使用 `wget`
 
 ```bash
 mkdir -p ocserv-docker && cd ocserv-docker
+wget -O install.sh https://raw.githubusercontent.com/moli-xia/ocserv-docker/main/install.sh
 wget -O ocserv_deploy.sh https://raw.githubusercontent.com/moli-xia/ocserv-docker/main/ocserv_deploy.sh
-chmod +x ocserv_deploy.sh
+chmod +x install.sh ocserv_deploy.sh
+./install.sh
 ```
 
 方式三: 使用 `curl`
 
 ```bash
 mkdir -p ocserv-docker && cd ocserv-docker
+curl -L https://raw.githubusercontent.com/moli-xia/ocserv-docker/main/install.sh -o install.sh
 curl -L https://raw.githubusercontent.com/moli-xia/ocserv-docker/main/ocserv_deploy.sh -o ocserv_deploy.sh
-chmod +x ocserv_deploy.sh
+chmod +x install.sh ocserv_deploy.sh
+./install.sh
 ```
 
-### 2. 交互式菜单部署
+### 3. 交互式菜单部署
 
 ```bash
 ./ocserv_deploy.sh
 ```
 
-### 3. 快速部署
+### 4. 快速部署
 
 默认账号:
 
@@ -71,7 +100,7 @@ chmod +x ocserv_deploy.sh
 ./ocserv_deploy.sh -q
 ```
 
-### 4. 自定义部署
+### 5. 自定义部署
 
 ```bash
 ./ocserv_deploy.sh -c
@@ -82,6 +111,7 @@ chmod +x ocserv_deploy.sh
 ```text
 ocserv-docker/
 ├── ocserv_deploy.sh
+├── install.sh
 ├── README.md
 ├── LICENSE
 └── .gitignore
@@ -103,6 +133,7 @@ ocserv-docker/
 
 ### 默认行为
 
+- 引导脚本: `install.sh`
 - 协议: AnyConnect
 - 容器内端口: `443/tcp` 和 `443/udp`
 - 宿主机端口: 优先使用 `443`，占用时自动改用 `8443+`
